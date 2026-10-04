@@ -1,3 +1,633 @@
+# NEC Document Tracking System: Database Schema
+
+This document describes the complete Supabase (PostgreSQL) database for the NEC Document Tracking System. It explains how to import the schema into Supabase, how each part works, and which rules the database enforces. The full SQL is in the [appendix](#appendix-full-schema-sql).
+
+| | |
+|---|---|
+| **Source of truth** | [`supabase/migrations/20261004000000_initial_schema.sql`](../supabase/migrations/20261004000000_initial_schema.sql). The appendix is a copy of this file. |
+| **Based on** | *NEC Document Tracking System – Requirements Specification* (04/10/2026) |
+| **Target** | Phase 1: online demo on Supabase cloud. Later: self-hosted Supabase on the office server (offline Mode A). |
+| **Frontend** | Next.js, to be built later. Not part of this document. |
+
+---
+
+## Contents
+
+1. [Overview](#1-overview)
+2. [Importing the schema into Supabase](#2-importing-the-schema-into-supabase)
+3. [After import: Supabase settings and first users](#3-after-import-supabase-settings-and-first-users)
+4. [Roles and access (Row Level Security)](#4-roles-and-access-row-level-security)
+5. [Tables](#5-tables)
+6. [How the main features work](#6-how-the-main-features-work)
+7. [Rules enforced by the database](#7-rules-enforced-by-the-database)
+8. [Views](#8-views)
+9. [Functions](#9-functions)
+10. [System settings](#10-system-settings)
+11. [Seed data](#11-seed-data)
+12. [Decisions recorded](#12-decisions-recorded)
+13. [Testing performed](#13-testing-performed)
+14. [Known limits and next steps](#14-known-limits-and-next-steps)
+15. [Appendix: full schema SQL](#appendix-full-schema-sql)
+
+---
+
+## 1. Overview
+
+The database is built around four guarantees from the specification:
+
+1. **Nothing is ever deleted.** No role has delete rights, and every table also has a trigger that rejects `DELETE` and `TRUNCATE`. Documents are voided with a reason instead. Configuration rows (categories, departments, …) are deactivated.
+2. **Saved records are locked.** Once a document is registered, its register fields can only change through a **correction request** that an Administrator approves. The old and new values are both kept.
+3. **Everything is audited.** Every insert and update is written to `audit_log`. The log is append-only, permanent and **hash-chained**: each entry's fingerprint includes the previous entry's, so tampering is detectable.
+4. **People only see what they are entitled to.** Row Level Security filters every query by role and by document classification (Open / Restricted / Confidential).
+
+```
+             ┌──────────────────────────── Supabase ────────────────────────────┐
+ Browser ──► │ Auth (logins, 2FA) ─► profiles (role, office, lock, password age)│
+ (Next.js)   │                                                                  │
+             │ PostgREST API ─► Row Level Security ─► tables ─► triggers        │
+ Next.js ──► │                    (who sees what)      │       (locks, numbers, │
+ API routes  │                                         │        audit, no-delete)│
+             │ Storage bucket "document-files" ◄───────┘  (scans, versions)     │
+             └──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Importing the schema into Supabase
+
+The schema is a single SQL file. Import it **once, into a new (empty) Supabase project**. Running it a second time fails, because the types and tables already exist.
+
+### Option A: Supabase Dashboard (simplest)
+
+1. Create a project at [supabase.com](https://supabase.com). Note the region and the database password.
+2. Open **SQL Editor → New query**.
+3. Copy the whole of [`supabase/migrations/20261004000000_initial_schema.sql`](../supabase/migrations/20261004000000_initial_schema.sql), or the [appendix](#appendix-full-schema-sql), into the editor.
+4. Click **Run**. It should finish with `Success. No rows returned`.
+5. Run the [verification queries](#verify-the-import) below.
+
+### Option B: Supabase CLI (repeatable, recommended once development starts)
+
+```bash
+# one-time
+npm install -g supabase            # or: brew install supabase/tap/supabase
+supabase login
+cd NEC-Document-Tracking-System---South-Sudan-Government
+supabase init                      # creates supabase/config.toml if it does not exist yet
+supabase link --project-ref <your-project-ref>
+
+# apply every file in supabase/migrations/ that has not been applied yet
+supabase db push
+```
+
+Later schema changes are added as **new** files in `supabase/migrations/`, named with a timestamp. Applied files are never edited.
+
+### What the import creates
+
+| Item | Count / name |
+|---|---|
+| Enumerated types | 23 |
+| Tables | 30 in `public` |
+| Views | 4 |
+| Functions | Helper, trigger and hook functions (see [section 9](#9-functions)) |
+| Storage bucket | `document-files` (private, 100 MB per file, PDF/TIFF/JPEG/PNG) |
+| Seed data | 2 offices, 4 priority rules, 7 categories, 9 document types, status transitions, system settings |
+| Database timezone | `Africa/Juba` (CAT, UTC+2) |
+
+### Verify the import
+
+```sql
+-- 30 tables
+select count(*) from information_schema.tables
+where table_schema = 'public' and table_type = 'BASE TABLE';
+
+-- RLS is on for every table (expect no rows)
+select tablename from pg_tables where schemaname = 'public' and not rowsecurity;
+
+-- seed data
+select code, name from public.offices;                 -- CH, SG
+select priority, label, response_hours from public.priority_rules order by sort_order;
+
+-- storage bucket
+select id, public from storage.buckets where id = 'document-files';   -- public = false
+
+-- timezone (open a new SQL editor tab first)
+show timezone;                                          -- Africa/Juba
+```
+
+---
+
+## 3. After import: Supabase settings and first users
+
+### 3.1 Auth settings (Dashboard → Authentication)
+
+| Setting | Value | Requirement |
+|---|---|---|
+| **Sign-ups** (Sign In / Providers) | Turn **off** "Allow new users to sign up" | Only Administrators create accounts |
+| **Email provider** | Enabled | Personal accounts |
+| **Minimum password length** | **10** | Password policy |
+| **Multi-Factor (TOTP)** | Enabled | 2FA for remote logins |
+| **Session inactivity timeout** (Sessions) | **15 minutes**, where your plan offers it. The Next.js app also enforces it. | Auto logout |
+| **Auth Hooks → Password Verification Attempt** | Point it at `public.hook_password_verification_attempt`, where your plan offers it | Lock after 5 failed logins |
+
+Some of these (session timeouts, auth hooks) depend on the Supabase plan. Check what your plan offers. The Next.js app will also enforce the 15-minute idle logout.
+
+### 3.2 Creating the two System Administrators
+
+Every user needs a row in `public.profiles` with a role. A user who exists in Supabase Auth but has **no profile can see nothing**.
+
+**Step 1.** Go to **Dashboard → Authentication → Users → Add user → Create new user** for each administrator, with **Auto Confirm User** ticked.
+
+**Step 2.** Run this in the SQL Editor (change the emails and names):
+
+```sql
+insert into public.profiles (id, full_name, email, role, office_id, job_title, must_change_password)
+select u.id, 'Executive Director name', u.email, 'system_administrator',
+       (select id from public.offices where code = 'CH'), 'Executive Director', false
+from auth.users u where u.email = 'executive.director@example.org';
+
+insert into public.profiles (id, full_name, email, role, office_id, job_title, must_change_password)
+select u.id, 'Secretary name', u.email, 'system_administrator',
+       (select id from public.offices where code = 'SG'), 'Secretary', false
+from auth.users u where u.email = 'secretary@example.org';
+```
+
+The database rejects a third active System Administrator.
+
+### 3.3 Creating all other users (from the app, later)
+
+The Next.js server, using the **service role key**, which must never be sent to the browser, calls the Supabase Admin API. The role and office go in `app_metadata`, which users cannot change themselves. A database trigger then creates the profile automatically:
+
+```ts
+await supabaseAdmin.auth.admin.createUser({
+  email: 'registry.officer@example.org',
+  password: temporaryPassword,          // min 10 chars; must be changed at first login
+  email_confirm: true,
+  app_metadata: {
+    role: 'registry_officer',            // system_administrator | registry_officer | action_officer | executive_viewer | auditor
+    full_name: 'Registry Officer name',
+    office_id: 1,                        // 1 = CH, 2 = SG (see public.offices)
+    department_id: null,
+    job_title: 'Registry Officer',
+    created_by: '<administrator profile id>'
+  }
+});
+```
+
+New users start with `must_change_password = true`, and see no data until they change their password.
+
+---
+
+## 4. Roles and access (Row Level Security)
+
+### 4.1 Database permissions by role
+
+| Role | Who | SELECT (view) | INSERT | UPDATE | DELETE |
+|---|---|---|---|---|---|
+| **System Administrator** | Executive Director; Secretary | ✅ All documents, including Confidential; audit trail | ✅ | ❌ | ❌ |
+| **Registry Officer** | Front-desk / registry staff | ✅ Open and Restricted, plus Confidential routed to them | ❌ | ❌ | ❌ |
+| **Action Officer** | Staff assigned documents | ✅ Only documents routed, copied or named to them | ❌ | ❌ | ❌ |
+| **Executive Viewer** | Chairperson; Secretary General; Deputy | ✅ All documents, including Confidential | ❌ | ❌ | ❌ |
+| **Auditor** | Internal audit (read-only) | ✅ Open and Restricted; audit trail | ❌ | ❌ | ❌ |
+
+- **No role can UPDATE or DELETE directly.** The one exception: a user can mark their *own* notifications as read.
+- **Confidential** documents are visible only to Administrators, Executive Viewers and named recipients, as the specification requires. Auditors therefore do not see Confidential documents.
+- **Open and Restricted** currently follow the same rules (decision recorded in [section 12](#12-decisions-recorded)).
+- The tables Administrators may insert into are: `offices`, `departments`, `categories`, `document_types`, `organisations`, `contacts`, `documents`, `incoming_details`, `outgoing_details`, `outgoing_recipients`, `document_links`, `document_files`, `document_file_versions`, `document_access`, `document_movements`, `document_minutes`, `document_actions`, `correction_requests`, `notifications`, `backup_restore_tests`, `disposal_requests`.
+- `audit_log`, `reference_counters` and `file_integrity_checks` are written only by the system.
+
+### 4.2 How the work of other roles reaches the database
+
+The specification gives Registry Officers and Action Officers workflow duties: registering, scanning, routing, recording actions and acknowledging receipt. At database level these roles have SELECT only. Their actions will be carried out by **Next.js API endpoints and database functions** (the next step). These check the user's role, perform the write, and record the user in the audit trail. The triggers in [section 7](#7-rules-enforced-by-the-database) apply to every write, whichever path it takes.
+
+### 4.3 Session checks applied to every query
+
+Before any row is returned, `is_session_permitted()` checks that the user:
+
+- has a profile and is **active** (not suspended),
+- is **not locked** (5 failed logins),
+- has **changed their first-login password**,
+- has a password **younger than 90 days**,
+- if remote access (Mode B) is on and they are outside the office network: is **allowed remote access** and **logged in with 2FA** (`aal2`).
+
+A user who fails any of these can still read **their own profile**, so the app can tell them why. They see no other data.
+
+---
+
+## 5. Tables
+
+### 5.1 Configuration
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `offices` | The two offices | `code` (CH, SG; used in reference numbers), `name` |
+| `departments` | Departments | `office_id` (optional), `name`, `is_active` |
+| `categories` | Document categories | `name`, `sort_order`, `is_active` |
+| `document_types` | Purpose / document type | `name`, `sort_order`, `is_active` |
+| `priority_rules` | Response time per priority | `priority`, `label`, `response_hours` |
+| `status_transitions` | Allowed status changes | `direction`, `from_status`, `to_status` |
+| `organisations` | Contacts list: organisations | `name` (unique, case-insensitive), `organisation_type`, `phone`, `email` |
+| `contacts` | Contacts list: people | `organisation_id`, `full_name`, `title`, `phone`, `email` |
+| `system_settings` | Key/value settings | `key`, `value` (JSON), `description` |
+
+### 5.2 Users
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `auth.users` | Supabase login (email, password, 2FA) | Managed by Supabase |
+| `profiles` | NEC user record | `role`, `office_id`, `department_id`, `is_active`, `suspended_at/by/reason`, `must_change_password`, `password_changed_at`, `failed_login_attempts`, `locked_at`, `remote_access_allowed`, `last_login_at` |
+
+### 5.3 Documents
+
+**`documents`**: one row per registered document, incoming or outgoing.
+
+| Column | Meaning |
+|---|---|
+| `direction` | `incoming` / `outgoing` |
+| `office_id` | Receiving office (incoming) or issuing office (outgoing) |
+| `reference_number`, `reference_year`, `reference_sequence` | e.g. `NEC/CH/IN/2026/00123`, set automatically |
+| `registered_by`, `registered_at` | Logged-in user; server time |
+| `received_at` | Incoming: date and time received (server time) |
+| `entry_mode`, `manual_register_form_no` | `system`, or `manual_register_backfill` for paper forms used during an outage (keeps the original receipt time) |
+| `subject`, `document_type_id`, `category_id` | Register fields |
+| `priority` | `urgent` / `high` / `normal` / `low` |
+| `classification` | `open` / `restricted` / `confidential` |
+| `office_only` | Never shown outside the office network (Mode B) |
+| `number_of_pages`, `number_of_attachments`, `physical_file_location` | Checked against the scan; where the original is filed |
+| `status` | See [6.3](#63-statuses) |
+| `current_holder_id`, `current_department_id`, `current_holder_since`, `current_physical_location` | Where the document is now and since when |
+| `due_at` | Set from priority; changed only with a reason |
+| `closing_note`, `closed_at`, `closed_by` | Required to close or file |
+| `is_voided`, `void_reason`, `voided_by`, `voided_at` | Cancel / Void instead of delete |
+| `search_vector` | Full-text index of reference and subject |
+
+**`incoming_details`**: one per incoming document.
+
+| Column | Meaning |
+|---|---|
+| `sender_organisation_id` / `sender_organisation_text` | From the contacts list, or free text |
+| `sender_contact_id`, `sender_name`, `sender_title` | Sender |
+| `delivered_by_name`, `delivered_by_phone`, `delivered_by_id_seen` | Person who brought it |
+| `delivery_method` | Hand delivery, courier, post, email, fax |
+| `sender_reference`, `sender_reference_date` | As printed on the letter |
+| `response_required`, `response_due_date` | Response to the sender |
+| `acknowledgement_method`, `acknowledgement_sent_to`, `acknowledgement_sent_at` | Acknowledgement slip (printed, SMS or email) |
+| `label_printed_at` | Label or receipt stamp on the paper original |
+
+**`outgoing_details`**: one per outgoing document.
+
+| Column | Meaning |
+|---|---|
+| `drafted_by` | Person who created it |
+| `signatory`, `signed_by_user_id`, `delegated_officer_name` | Chairperson, SG or delegated officer |
+| `finalised_at`, `finalised_by` | Set when marked Final (the record then locks) |
+| `dispatch_method`, `dispatched_at`, `dispatched_by_name`, `dispatch_recorded_by` | Dispatch (no fax) |
+| `delivered_at`, `proof_of_delivery_note` | Delivery; the proof scan is a `proof_of_delivery` file |
+| `feedback_required`, `feedback_due_date`, `feedback_officer_id` | Follow-up |
+| `feedback_received_at`, `feedback_document_id` | The incoming reply that closes the follow-up |
+
+**Other document tables**
+
+| Table | Purpose |
+|---|---|
+| `outgoing_recipients` | Multiple *To* and *Cc* recipients (organisation, name, title) |
+| `document_links` | `related`, `in_reply_to`, `feedback_for`, `internal_memo_pair` |
+| `reference_counters` | The running number for each office, direction and year (internal) |
+
+### 5.4 Files
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `document_files` | A file on a document | `file_kind`: `main_scan`, `attachment`, `draft`, `signed_copy`, `proof_of_delivery`, `acknowledgement_slip` |
+| `document_file_versions` | Every upload, never overwritten | `version_number`, `storage_path`, `sha256`, `size_bytes`, `mime_type`, `page_count`, `scan_dpi`, `is_colour`, `is_pdfa`, `ocr_text`, `reason`, `uploaded_by` |
+| `file_integrity_checks` | Scheduled fingerprint checks | `computed_sha256`, `result` (`match` / `mismatch` / `missing`) |
+
+### 5.5 Workflow
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `document_access` | Primary owner, copies, named recipients | `user_id`, `access_type`, `granted_by`, `revoked_at`, `revoke_reason` |
+| `document_movements` | Every hand-over | `movement_type`, `from_user_id`, `to_user_id`, `to_department_id`, `to_physical_location`, `reason`, `moved_at`, `acknowledged_at`, `acknowledged_by` |
+| `document_minutes` | Chairperson / SG instructions | `author_id`, `directed_to_user_id`, `minute_text` |
+| `document_actions` | Comments, actions, feedback | `action_type`, `action_text` |
+| `due_date_changes` | Due-date history | `old_due_at`, `new_due_at`, `reason`, `changed_by` |
+
+### 5.6 Integrity, notifications and operations
+
+| Table | Purpose |
+|---|---|
+| `correction_requests` | Field, old value, new value, reason, requester, approver, decision, applied time |
+| `audit_log` | Permanent, hash-chained record of every event |
+| `notifications` | In-system alerts (email/SMS channels for later) |
+| `backup_runs` | Log written by the backup script |
+| `backup_restore_tests` | Quarterly restore tests |
+| `disposal_requests` | Records disposal, which needs two different Administrators to approve |
+
+### 5.7 Relationships
+
+```mermaid
+erDiagram
+  offices ||--o{ documents : "receives / issues"
+  profiles ||--o{ documents : "registers / holds"
+  documents ||--o| incoming_details : "incoming"
+  documents ||--o| outgoing_details : "outgoing"
+  documents ||--o{ outgoing_recipients : "to / cc"
+  documents ||--o{ document_files : has
+  document_files ||--|{ document_file_versions : "versions (SHA-256, OCR)"
+  documents ||--o{ document_movements : "hand-overs"
+  documents ||--o{ document_access : "owner / copies / named"
+  documents ||--o{ document_minutes : minutes
+  documents ||--o{ document_actions : actions
+  documents ||--o{ due_date_changes : "due-date history"
+  documents ||--o{ correction_requests : corrections
+  documents ||--o{ document_links : links
+  documents ||--o{ audit_log : events
+  organisations ||--o{ incoming_details : sender
+  organisations ||--o{ contacts : people
+  categories ||--o{ documents : category
+  document_types ||--o{ documents : type
+```
+
+---
+
+## 6. How the main features work
+
+### 6.1 Reference numbers
+
+- Format: `NEC/<office code>/<IN|OUT>/<year>/<5-digit sequence>`, for example `NEC/CH/IN/2026/00123` or `NEC/SG/OUT/2026/00045`.
+- Generated by the insert trigger on `documents`, using `next_reference_number()`. You never supply one.
+- Each office and direction has its own counter (`reference_counters`), which restarts at `00001` each calendar year in South Sudan time.
+- The counter row is locked during the transaction. If the save fails, the number is not used up, so committed numbers have **no gaps and are never reused**. Voided documents keep their number.
+- Outgoing numbers are issued at registration (status Draft), so they can be typed on the letter before signature.
+
+### 6.2 Registering a document
+
+A registration is **one transaction**, so that the specification's "the record cannot be saved without the scan" can be enforced:
+
+**Incoming:** upload the scan to Storage, then in **one transaction**:
+
+1. insert into `documents` (`direction = 'incoming'`)
+2. insert into `incoming_details`
+3. insert into `document_files` (`file_kind = 'main_scan'`)
+4. insert into `document_file_versions` (with `sha256` and `ocr_text`)
+
+At commit, the database checks that the details and the scan exist. If either is missing, nothing is saved.
+
+**Outgoing:** in one transaction, insert into `documents` (`direction = 'outgoing'`) and `outgoing_details`. Recipients can be added in the same transaction.
+
+The browser client (`supabase-js`) sends each insert as a separate transaction. Registration will therefore be a single API call: a Next.js endpoint or database function (next step) that does all the inserts together.
+
+The insert trigger also sets:
+
+- `registered_at` and `received_at` to server time,
+- `registered_by` to the logged-in user,
+- `status` to `registered` (incoming) or `draft` (outgoing),
+- `due_at` to received time plus the priority's response time,
+- the current holder to the registering user.
+
+### 6.3 Statuses
+
+Allowed changes are listed in `status_transitions`. Any other change is rejected.
+
+**Incoming**
+
+```
+registered ──► routed ──► with_action_officer ──► action_taken ──► closed
+     │            │  ▲           │   ▲   │             │
+     │            │  │           │   │   └─────────────┼──► closed (noted)
+     │            ▼  │           ▼   │                 └──► with_action_officer (rework)
+     │      returned_for_clarification / on_hold
+     └──────────────► filed  (also from routed / with_action_officer)
+```
+
+**Outgoing**
+
+```
+draft ──► final (locked) ──► dispatched ──► delivered ──► awaiting_feedback ──► closed
+                                                 └────────────────────────────► closed (no feedback needed)
+```
+
+Extra checks when the status changes:
+
+- **closed / filed:** a closing note, `closed_at` and `closed_by` are required.
+- **outgoing → final:** `finalised_at` and `finalised_by` are recorded, and the record locks.
+- **outgoing → delivered:** needs the delivery date plus a proof-of-delivery note or file.
+- **outgoing → closed:** needs the signed scanned copy.
+
+### 6.4 Routing, hand-overs and acknowledgement
+
+- Every hand-over is a row in `document_movements`: from whom, to whom, date and time, and reason. It covers system routing, forwarding, returning, reassigning and physical file movement.
+- Movements cannot be edited or removed. Only `acknowledged_at` / `acknowledged_by` can be filled in, once.
+- Hand-overs not acknowledged after 24 hours appear in `v_unacknowledged_movements`.
+- `document_access` records the primary owner (only one at a time), copies and named recipients. It also controls who outside the all-seeing roles can see a document.
+- Minutes from the Chairperson / SG go in `document_minutes`. Comments, actions and feedback go in `document_actions`.
+
+### 6.5 Due dates
+
+- Set automatically from `priority_rules`: Urgent 24 h, High 72 h, Normal 168 h, Low 336 h.
+- To change one, a row goes in `due_date_changes` with a reason. The `documents.due_at` change is accepted only inside that operation. A direct change is rejected.
+
+### 6.6 Locking and corrections
+
+- After registration, the register fields of `documents`, `incoming_details`, `outgoing_details` and `outgoing_recipients` are locked. Only workflow fields can change: status, holder, closing, acknowledgement, dispatch, delivery and feedback.
+- An outgoing document stays editable while it is a **Draft**. It locks when marked **Final**.
+- To change a locked field:
+  1. A user creates a `correction_requests` row (field, old value, new value, reason).
+  2. An Administrator other than the requester approves or rejects it.
+  3. The approved change is applied inside the correction operation. The audit entry stores the old value, the new value and the correction request ID.
+- Reference numbers, office, direction, registered-by and registered-at **cannot change at all**, not even by correction.
+- A **voided** document cannot change any further.
+
+### 6.7 Files and fingerprints
+
+- Bucket `document-files` is **private**. Path convention: `{document_id}/{file_id}/v{version}.pdf`.
+- Files can be read by anyone who can see the document. Direct uploads are allowed for Administrators; Registry Officers upload through the Next.js API endpoint.
+- Storage has **no update or delete policy**, so a stored file can never be replaced or removed. A re-scan is uploaded as a new version, with a reason, and the original stays in the history.
+- Each version stores its **SHA-256** fingerprint. A scheduled job (next step) re-hashes the stored files and writes the results to `file_integrity_checks`. Any `mismatch` or `missing` result alerts the Administrators.
+- OCR text goes in `document_file_versions.ocr_text`, which is automatically indexed for full-text search (`ocr_tsv`).
+
+### 6.8 Audit trail
+
+- A trigger on every records table writes an entry for each insert and update: the actor, the time, the IP address and browser (from the API request), the document, and for updates **only the changed fields with their old and new values**.
+- The browser reports views, downloads, prints, report exports, logins and logouts through `log_client_event()`, which accepts only those event types.
+- Failed logins and account locks are written by the password hook.
+- **Hash chain:** `row_hash = sha256(prev_hash | id | time | actor | event | document | details)`. This query checks the chain:
+
+```sql
+select bool_and(ok) as chain_intact from (
+  select row_hash = encode(sha256(convert_to(concat_ws('|',
+           coalesce(prev_hash, 'GENESIS'), id, extract(epoch from occurred_at),
+           actor_id, event_type, document_id, details::text), 'UTF8')), 'hex')
+     and prev_hash is not distinct from lag(row_hash) over (order by id) as ok
+  from public.audit_log) a;
+```
+
+### 6.9 Search
+
+- `documents.search_vector`: full-text index of reference number and subject.
+- `document_file_versions.ocr_tsv`: full-text index of words inside scans.
+- Trigram indexes on subject and sender names, for misspellings and partial matches.
+- Every search goes through Row Level Security, so users never find Confidential documents they are not entitled to.
+
+```sql
+-- words inside scanned letters
+select distinct d.reference_number, d.subject
+from public.document_file_versions v
+join public.documents d on d.id = v.document_id
+where v.ocr_tsv @@ websearch_to_tsquery('english', 'voter registration');
+```
+
+### 6.10 Accounts
+
+- **Two administrators at most:** the trigger `limit_administrators` rejects a third active System Administrator.
+- **Lockout:** after 5 failed passwords, `locked_at` is set and further logins are rejected until an Administrator unlocks the account.
+- **Suspension:** `is_active = false`, with `suspended_at`, `suspended_by` and `suspension_reason`. The user's history is untouched.
+- **Password age:** measured from `password_changed_at` (90 days by default).
+
+---
+
+## 7. Rules enforced by the database
+
+| Rule | Mechanism |
+|---|---|
+| No deletes, by anyone | `prevent_delete` and `prevent_truncate` triggers on all 30 tables, and no DELETE grant |
+| Permanent tables cannot be edited | `prevent_update` on `audit_log`, `document_file_versions`, `file_integrity_checks`, `document_minutes`, `document_actions`, `due_date_changes`, `document_links`, `document_files`, `backup_restore_tests` |
+| Only certain columns can change | `tg_allow_only` on `document_access` (revoke only), `notifications` (read/sent), `backup_runs`, `disposal_requests`; `movements_lock`; `corrections_lock` |
+| Register fields lock on save | `documents_before_update`, `tg_details_lock` |
+| Incoming cannot be saved without a scan | `documents_check_complete` (checked at commit) |
+| Server time, automatic reference numbers, due dates | `documents_before_insert` |
+| Valid status changes only | `status_transitions` and `documents_before_update` |
+| At most two administrators | `limit_administrators` |
+| Everything audited | `audit_row` triggers and `audit_chain` |
+| Required fields and consistency | Check constraints: closing note, void reason, response due date when a response is required, feedback officer and due date when feedback is required, delegated officer named, sender organisation given, no fax for outgoing, and others |
+
+---
+
+## 8. Views
+
+All views use `security_invoker`, so they respect the viewer's Row Level Security.
+
+| View | Use |
+|---|---|
+| `v_document_tracker` | Every document: current holder, how long held, due date, `is_overdue`, `days_overdue`. Drives the dashboard and the "where is it" screen. |
+| `v_unacknowledged_movements` | Hand-overs not acknowledged within 24 hours |
+| `v_feedback_overdue` | Outgoing documents whose feedback is past its due date |
+| `v_current_file_versions` | The latest version of each file |
+
+---
+
+## 9. Functions
+
+| Function | Purpose |
+|---|---|
+| `my_role()`, `has_role(...)` | The current user's role |
+| `is_session_permitted()` | Active, unlocked, password current, 2FA when remote |
+| `can_view_document(id)` | Classification and access rules |
+| `is_office_network()`, `request_ip()` | Office-network check for Mode B |
+| `setting(key)` | Read a system setting |
+| `next_reference_number(...)` | Reference number generator |
+| `log_client_event(event, document, details)` | Client-reported audit events (view, download, print, export, login, logout) |
+| `write_audit(...)` | Internal audit writer |
+| `hook_password_verification_attempt(event)` | Supabase Auth hook: counts failed logins and locks the account |
+| `changed_columns(...)`, `in_correction_context()` | Internal helpers for the lock triggers |
+| `tg_*` | Trigger functions |
+
+---
+
+## 10. System settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `remote_access_enabled` | `false` | Mode B. While `false`, every connection counts as "office". |
+| `office_networks` | `["192.168.0.0/16", "10.0.0.0/8"]` | Office LAN ranges, used when Mode B is on |
+| `email_alerts_enabled` | `false` | Email alerts |
+| `sms_alerts_enabled` | `false` | SMS alerts |
+| `password_min_length` | `10` | Also set in Supabase Auth |
+| `password_max_age_days` | `90` | Password expiry |
+| `max_failed_logins` | `5` | Lockout threshold |
+| `session_idle_minutes` | `15` | Idle logout (enforced by Supabase Auth and the app) |
+| `acknowledge_within_hours` | `24` | Unacknowledged hand-over flag |
+| `confidential_office_only_default` | `true` | New Confidential documents default to office-only |
+
+For the online demo, keep `remote_access_enabled = false`. Every logged-in user is then treated as being on the office network, and 2FA is not forced.
+
+---
+
+## 11. Seed data
+
+| Table | Rows |
+|---|---|
+| `offices` | CH, Office of the Chairperson; SG, Office of the Secretary General |
+| `priority_rules` | Urgent 24 h · High 72 h · Normal 168 h · Low 336 h |
+| `categories` | Operations, Finance, Legal, Partners/Donors, Political parties, Government, HR |
+| `document_types` | Letter, Request, Invitation, Report, Complaint, Legal notice, Invoice, Memo, Other |
+| `status_transitions` | As in [6.3](#63-statuses) |
+| `system_settings` | As in [section 10](#10-system-settings) |
+
+NEC still has to confirm the final categories, departments and priority times. Administrators can add categories and departments. Existing rows are deactivated, not deleted.
+
+---
+
+## 12. Decisions recorded
+
+| Topic | Decision |
+|---|---|
+| Database permissions | Administrators: SELECT + INSERT. Registry Officer, Action Officer, Executive Viewer, Auditor: SELECT. **No role can delete.** Auditors cannot edit anything. |
+| Restricted vs Open | Left as is. Both follow the same visibility rules. |
+| Internal memos | Kept as ordinary records: an outgoing record in the sending office and an incoming record in the receiving office, linked as `internal_memo_pair`. |
+| Locked accounts | Stay locked until an Administrator unlocks them. |
+| Roles | One role per user. |
+| File uploads | Through the UI, using a Next.js API endpoint connected to Supabase. |
+| Offline working | Deferred. Phase 1 is an **online demo** on Supabase cloud. The offline architecture will be designed afterwards. |
+| Frontend | Next.js, built later. |
+
+---
+
+## 13. Testing performed
+
+I applied the schema to a local PostgreSQL 16 database, using stand-ins for Supabase's `auth` and `storage` schemas. All of these checks passed:
+
+- Reference numbers came out as `NEC/CH/IN/2026/00001`, `…00002`, `NEC/SG/IN/2026/00001` and `NEC/CH/OUT/2026/00001`. A failed save did not use up a number.
+- An incoming record without a scan was rejected. A document without its details row was rejected at commit.
+- A High priority document got a due date of received time + 3 days.
+- Editing a saved subject, sender, reference number or due date was blocked. An approved correction went through, and the audit entry shows the old and new values and the request ID. A decided correction could not be decided again.
+- Delete and truncate were blocked on documents and the audit log. Editing an audit entry or a file version was blocked.
+- Invalid status jumps were blocked. Changing a voided document was blocked.
+- An outgoing draft could be edited and locked once Final. Delivered without proof was blocked. Closing without the signed copy was blocked.
+- Access, tested as the actual browser role:
+  - An Administrator could insert an organisation, a category, and an outgoing document with its details (with the registering user forced to the Administrator, and the audit actor correct).
+  - A Registry Officer and an Auditor could not insert.
+  - An Administrator could not update or delete.
+  - Each role saw exactly the documents in [4.1](#41-database-permissions-by-role). An Action Officer saw no audit rows.
+  - Storage: an Administrator could upload; a Registry Officer could not upload directly.
+- Full-text search found a phrase inside OCR text and respected classification.
+- A third administrator was rejected. A Dashboard-created user without a role got no profile and no access.
+- 5 failed passwords locked the account, and the lock then rejected a correct password.
+- The audit hash chain verified intact.
+
+---
+
+## 14. Known limits and next steps
+
+1. **Workflow functions and API endpoints (next step):**
+   - registering incoming and outgoing documents as a single call,
+   - routing, forwarding, returning and acknowledging,
+   - minutes and actions, due-date changes, closing and voiding,
+   - correction requests and approvals,
+   - Final, dispatch, delivery and feedback,
+   - user management (create, suspend, reset, unlock),
+   - file upload and the OCR pipeline.
+2. **Scheduled jobs:** due-in-24-hours and overdue alerts, the daily overdue summary, fingerprint checks (for example with `pg_cron` or Supabase Edge Functions).
+3. **Plan-dependent Supabase features:** the session inactivity timeout and auth hooks depend on the Supabase plan. The app will also enforce the idle logout.
+4. **Offline Mode A:** the same migration runs on self-hosted Supabase. The deployment design comes after the demo.
+5. **Who keeps unrestricted database access:** the `postgres` superuser and the service role key bypass Row Level Security. The no-delete and lock triggers still apply to them, but a superuser could disable triggers. After handover these credentials must be held only by the two Administrators.
+
+---
+
+## Appendix: full schema SQL
+
+This is the complete content of `supabase/migrations/20261004000000_initial_schema.sql`. Paste it into the Supabase SQL Editor and run it once on a new project.
+
+```sql
 -- =============================================================================
 -- NEC Document Tracking System — initial database schema (Supabase / PostgreSQL)
 -- =============================================================================
@@ -1639,3 +2269,4 @@ insert into public.system_settings (key, value, description) values
   ('session_idle_minutes',    '15',     'Automatic logout after inactivity'),
   ('acknowledge_within_hours','24',     'Flag hand-overs not acknowledged within this time'),
   ('confidential_office_only_default', 'true', 'New Confidential documents are office-only by default (Mode B)');
+```

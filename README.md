@@ -2,7 +2,12 @@
 
 A secure, auditable system for registering, scanning, storing and tracking every incoming and outgoing document handled by the **Office of the Chairperson** and the **Office of the Secretary General** of the National Elections Commission (NEC), South Sudan.
 
-> **Project status:** Requirements stage. This repository currently holds the project description, based on the *NEC Document Tracking System – Requirements Specification* (dated 4 October 2026). No application code has been written yet. The build approach (custom application or configured open-source records system) is to be proposed by the technician and confirmed by NEC.
+> **Project status:** Database design stage. Phase 1 is an online demo built on **Supabase** (database, auth, file storage) with a **Next.js** frontend (not yet started). The database schema is ready to import; see [docs/DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md). The offline office deployment will be designed after the demo.
+>
+> | Item | Location |
+> |---|---|
+> | Database schema documentation (import guide, roles, tables, rules, full SQL) | [`docs/DATABASE_SCHEMA.md`](docs/DATABASE_SCHEMA.md) |
+> | Schema migration (SQL) | [`supabase/migrations/20261004000000_initial_schema.sql`](supabase/migrations/20261004000000_initial_schema.sql) |
 
 ---
 
