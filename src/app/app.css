@@ -199,3 +199,7 @@ form.inline { display: inline; }
   .page-head { border: 0; padding: 0 0 12px; }
   a { color: inherit; text-decoration: none; }
 }
+
+/* locked demo password slot: not selectable, not editable */
+.locked-secret { -webkit-user-select: none; user-select: none; pointer-events: none; cursor: not-allowed; background: var(--surface-alt); letter-spacing: .3em; color: var(--muted); caret-color: transparent; }
+.locked-secret::selection { background: transparent; }

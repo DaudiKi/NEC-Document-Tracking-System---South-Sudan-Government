@@ -11,7 +11,8 @@ The web application is a Next.js app (App Router, TypeScript) in `src/`. It talk
 | `SUPABASE_SERVICE_ROLE_KEY` | for administration | **Server only, never expose.** Creating users and resetting passwords (Auth Admin API), the daily jobs, file integrity checks, failed-login counting. Without it, sign-in, registration, routing, search and reports all still work. |
 | `CRON_SECRET` | for the daily jobs | Any long random string. Vercel Cron sends it as `Authorization: Bearer …` |
 | `AUTH_HOOK_ENABLED` | optional | `true` only when the Supabase Auth hook "Password Verification Attempt" is pointed at `public.hook_password_verification_attempt`. Then the app does not count failed logins itself. |
-| `NEXT_PUBLIC_DEMO_MODE` | demo only | `true` shows the demo account list on the sign-in screen |
+| `NEXT_PUBLIC_DEMO_MODE` | demo only | `true` shows the demo account list on the sign-in screen. Anyone who can open the site can then sign in as any demo role, so switch it off for real use. |
+| `DEMO_PASSWORD` | demo only | The shared password of the demo accounts. **Server only.** On the sign-in screen the password slot is filled automatically and locked; the server adds the real password when the form is submitted, so it never reaches the browser. |
 | `MAX_UPLOAD_MB` | optional | Upload limit on a self-hosted server (default 25). On Vercel the limit is 4 MB, the platform's request size limit. |
 
 ## 2. Deploy to Vercel

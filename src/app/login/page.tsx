@@ -1,7 +1,5 @@
-import { signIn } from './actions';
-import ActionForm, { SubmitButton } from '@/components/ActionForm';
+import LoginForm from './LoginForm';
 import { Notice } from '@/components/ui';
-import DemoAccounts from './DemoAccounts';
 
 export const metadata = { title: 'Sign in' };
 
@@ -31,19 +29,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
         </div>
         {reason === 'idle' && <Notice kind="warning" label="Signed out.">You were signed out after 15 minutes without activity. Sign in again to continue.</Notice>}
         {reason === 'changed' && <Notice kind="success" label="Password changed.">Sign in with your new password.</Notice>}
-        <ActionForm action={signIn} className="stack">
-          <div className="field">
-            <label htmlFor="email">Email address</label>
-            <input id="email" name="email" type="email" autoComplete="username" required autoFocus />
-          </div>
-          <div className="field">
-            <label htmlFor="password">Password</label>
-            <input id="password" name="password" type="password" autoComplete="current-password" required />
-            <span className="hint">At least 10 characters. Changed every 90 days. The account locks after 5 failed attempts.</span>
-          </div>
-          <div><SubmitButton pendingLabel="Signing in…">Sign In</SubmitButton></div>
-        </ActionForm>
-        {demo && <DemoAccounts />}
+        <LoginForm demo={demo} />
         <p className="login__foot">Accounts are created only by the two System Administrators: the Executive Director and the Secretary. Lost your password? Ask an administrator to reset it. Activity on this system is recorded.</p>
       </section>
     </main>

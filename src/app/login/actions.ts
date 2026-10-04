@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { IDLE_COOKIE } from '@/lib/supabase/middleware';
 import { guard, str, UserError } from '@/lib/actions';
+import { isDemoEmail } from '@/lib/demo';
 
 async function clientInfo() {
   const h = await headers();
@@ -13,7 +14,13 @@ async function clientInfo() {
 
 export const signIn = guard(async (fd) => {
   const email = str(fd, 'email').toLowerCase();
-  const password = String(fd.get('password') ?? '');
+  let password = String(fd.get('password') ?? '');
+  // Demo mode: for the listed demo accounts the server supplies the shared password itself, so it
+  // never reaches the browser. Outside demo mode the typed password is always used.
+  if (fd.get('demo') === '1' && process.env.NEXT_PUBLIC_DEMO_MODE === 'true' && isDemoEmail(email)) {
+    if (!process.env.DEMO_PASSWORD) throw new UserError('The demo password is not configured on the server (DEMO_PASSWORD).');
+    password = process.env.DEMO_PASSWORD;
+  }
   if (!email || !password) throw new UserError('Enter your email address and password.');
   const supabase = await createClient();
   const admin = createAdminClient();
@@ -21,6 +28,10 @@ export const signIn = guard(async (fd) => {
 
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
   if (error || !data.user) {
+    // A network or service problem is not a wrong password: say so, and do not count it toward the lockout.
+    if (error && error.code !== 'invalid_credentials' && (!error.status || error.status >= 500)) {
+      throw new UserError('The sign-in service could not be reached. Check the connection and try again.');
+    }
     // Count the failure (locks the account after 5) unless the Supabase Auth hook already does.
     if (admin && !hookHandlesLockout) {
       const { data: p } = await admin.from('profiles').select('id, locked_at, is_active').eq('email', email).maybeSingle();
