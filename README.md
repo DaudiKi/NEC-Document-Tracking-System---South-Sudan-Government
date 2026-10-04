@@ -2,12 +2,16 @@
 
 A secure, auditable system for registering, scanning, storing and tracking every incoming and outgoing document handled by the **Office of the Chairperson** and the **Office of the Secretary General** of the National Elections Commission (NEC), South Sudan.
 
-> **Project status:** Database design stage. Phase 1 is an online demo built on **Supabase** (database, auth, file storage) with a **Next.js** frontend (not yet started). The database schema is ready to import; see [docs/DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md). The offline office deployment will be designed after the demo.
+> **Project status:** Phase 1 online demo. The database (Supabase), the workflow functions and the web application (Next.js, on the NEC design system) are built. The offline office deployment is designed after the demo.
 >
 > | Item | Location |
 > |---|---|
 > | Database schema documentation (import guide, roles, tables, rules, full SQL) | [`docs/DATABASE_SCHEMA.md`](docs/DATABASE_SCHEMA.md) |
-> | Schema migration (SQL) | [`supabase/migrations/20261004000000_initial_schema.sql`](supabase/migrations/20261004000000_initial_schema.sql) |
+> | Schema migration | [`supabase/migrations/20261004000000_initial_schema.sql`](supabase/migrations/20261004000000_initial_schema.sql) |
+> | Function privileges fix | [`supabase/migrations/20261004000100_restrict_function_execute.sql`](supabase/migrations/20261004000100_restrict_function_execute.sql) |
+> | Workflow functions, report views, search, dashboard | [`supabase/migrations/20261004000200_workflow_functions.sql`](supabase/migrations/20261004000200_workflow_functions.sql) |
+> | Database tests (89 checks, run on a local PostgreSQL 16) | [`supabase/tests/`](supabase/tests/README.md) |
+> | Running and deploying the application | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) |
 
 ---
 
